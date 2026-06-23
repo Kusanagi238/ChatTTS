@@ -1,15 +1,15 @@
+import gc
+import logging
 import platform
 from dataclasses import dataclass
-import logging
-from typing import Union, List, Optional, Tuple, Callable
-import gc
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
 from tqdm import tqdm
-from transformers import LlamaModel, LlamaConfig
+from transformers import LlamaConfig, LlamaModel
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import is_flash_attn_2_available
@@ -60,7 +60,6 @@ class GPT(nn.Module):
         self, gpt_folder: str, embed_file_path: str, experimental=False
     ):
         if self.is_vllm and platform.system().lower() == "linux":
-
             from .velocity import LLM
 
             self.llm = LLM(
@@ -114,7 +113,6 @@ class GPT(nn.Module):
         self,
         config: dict,
     ) -> Tuple[LlamaModel, LlamaConfig]:
-
         if self.use_flash_attn and is_flash_attn_2_available():
             llama_config = LlamaConfig(
                 **config,
@@ -212,13 +210,21 @@ class GPT(nn.Module):
                 and attention_mask.shape[1] > input_ids.shape[1]
             ):
                 start = attention_mask.shape[1] - past_length
-                input_ids = input_ids.narrow(1, -start, start)
+                # ensure we only call narrow with a non-negative length
+                if start > 0:
+                    input_ids = input_ids.narrow(1, -start, start)
+                else:
+                    # nothing to narrow; keep input_ids as-is
+                    pass
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
-                input_ids = input_ids.narrow(
-                    1, past_length, input_ids.size(1) - past_length
-                )
+                rem = input_ids.size(1) - past_length
+                if rem > 0:
+                    input_ids = input_ids.narrow(1, past_length, rem)
+                else:
+                    # nothing to keep
+                    input_ids = input_ids.narrow(1, 0, 0)
             # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
@@ -227,18 +233,25 @@ class GPT(nn.Module):
                 and attention_mask is not None
                 and cache_length + input_ids.shape[1] > max_cache_length
             ):
-                attention_mask = attention_mask.narrow(
-                    1, -max_cache_length, max_cache_length
-                )
+                if max_cache_length > 0:
+                    attention_mask = attention_mask.narrow(
+                        1, -max_cache_length, max_cache_length
+                    )
+                else:
+                    # nothing to keep
+                    attention_mask = attention_mask.narrow(1, 0, 0)
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask.eq(0), 1)
             if past_key_values:
-                position_ids = position_ids.narrow(
-                    1, -input_ids.shape[1], input_ids.shape[1]
-                )
+                if input_ids.shape[1] > 0:
+                    position_ids = position_ids.narrow(
+                        1, -input_ids.shape[1], input_ids.shape[1]
+                    )
+                else:
+                    position_ids = position_ids.narrow(1, 0, 0)
 
         input_length = (
             position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
@@ -248,7 +261,10 @@ class GPT(nn.Module):
                 past_length, past_length + input_length, device=input_ids.device
             )
         else:
-            cache_position = cache_position.narrow(0, -input_length, input_length)
+            if input_length > 0:
+                cache_position = cache_position.narrow(0, -input_length, input_length)
+            else:
+                cache_position = cache_position.narrow(0, 0, 0)
 
         if has_static_cache:
             past_key_values = None
@@ -335,13 +351,15 @@ class GPT(nn.Module):
         manual_seed: Optional[int] = None,
         context=Context(),
     ):
-
         attentions: List[Optional[Tuple[torch.FloatTensor, ...]]] = []
         hiddens = []
         stream_iter = 0
 
-        start_idx, end_idx = inputs_ids.shape[1], torch.zeros(
-            inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+        start_idx, end_idx = (
+            inputs_ids.shape[1],
+            torch.zeros(
+                inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+            ),
         )
         finish = torch.zeros(inputs_ids.shape[0], device=inputs_ids.device).bool()
 
@@ -392,7 +410,6 @@ class GPT(nn.Module):
         past_key_values = None
 
         for i in range(max_new_token):
-
             model_input = self._prepare_generation_inputs(
                 inputs_ids,
                 past_key_values,
@@ -571,7 +588,12 @@ class GPT(nn.Module):
 
             del idx_next
             progress += 1
-            inputs_ids = inputs_ids_buf.narrow(1, 0, progress)
+            # ensure the length passed to narrow is non-negative
+            if progress <= 0:
+                # create an empty slice when progress is zero or negative
+                inputs_ids = inputs_ids_buf.narrow(1, 0, 0)
+            else:
+                inputs_ids = inputs_ids_buf.narrow(1, 0, progress)
 
             not_finished = finish.logical_not().to(end_idx.device)
             end_idx.add_(not_finished.int())
