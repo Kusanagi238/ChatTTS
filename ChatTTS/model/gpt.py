@@ -1,15 +1,15 @@
+import gc
+import logging
 import platform
 from dataclasses import dataclass
-import logging
-from typing import Union, List, Optional, Tuple, Callable
-import gc
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
 from tqdm import tqdm
-from transformers import LlamaModel, LlamaConfig
+from transformers import LlamaConfig, LlamaModel
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import is_flash_attn_2_available
@@ -60,7 +60,6 @@ class GPT(nn.Module):
         self, gpt_folder: str, embed_file_path: str, experimental=False
     ):
         if self.is_vllm and platform.system().lower() == "linux":
-
             from .velocity import LLM
 
             self.llm = LLM(
@@ -114,7 +113,6 @@ class GPT(nn.Module):
         self,
         config: dict,
     ) -> Tuple[LlamaModel, LlamaConfig]:
-
         if self.use_flash_attn and is_flash_attn_2_available():
             llama_config = LlamaConfig(
                 **config,
@@ -179,6 +177,20 @@ class GPT(nn.Module):
                 )
             has_static_cache = past_key_values is not None
 
+        # Helper to safely call narrow with possibly negative starts/lengths
+        def _safe_narrow(
+            tensor: torch.Tensor, dim: int, start: int, length: int
+        ) -> torch.Tensor:
+            # Interpret negative start as offset from the end (like Python indexing intent)
+            if start < 0:
+                start = tensor.size(dim) + start
+            if start < 0:
+                start = 0
+            length = int(length)
+            # Clamp length to available range
+            length = max(0, min(length, tensor.size(dim) - start))
+            return tensor.narrow(dim, start, length)
+
         past_length = 0
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
@@ -212,13 +224,13 @@ class GPT(nn.Module):
                 and attention_mask.shape[1] > input_ids.shape[1]
             ):
                 start = attention_mask.shape[1] - past_length
-                input_ids = input_ids.narrow(1, -start, start)
+                # Keep last `start` tokens of input_ids (safe for negative start semantics)
+                input_ids = _safe_narrow(input_ids, 1, -start, start)
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
-                input_ids = input_ids.narrow(
-                    1, past_length, input_ids.size(1) - past_length
-                )
+                length = input_ids.size(1) - past_length
+                input_ids = _safe_narrow(input_ids, 1, past_length, length)
             # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
@@ -227,8 +239,10 @@ class GPT(nn.Module):
                 and attention_mask is not None
                 and cache_length + input_ids.shape[1] > max_cache_length
             ):
-                attention_mask = attention_mask.narrow(
-                    1, -max_cache_length, max_cache_length
+                # Keep last `max_cache_length` positions in attention mask
+                start_pos = attention_mask.shape[1] - max_cache_length
+                attention_mask = _safe_narrow(
+                    attention_mask, 1, start_pos, max_cache_length
                 )
 
         if attention_mask is not None and position_ids is None:
@@ -236,8 +250,9 @@ class GPT(nn.Module):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask.eq(0), 1)
             if past_key_values:
-                position_ids = position_ids.narrow(
-                    1, -input_ids.shape[1], input_ids.shape[1]
+                # Keep only positions corresponding to input_ids
+                position_ids = _safe_narrow(
+                    position_ids, 1, -input_ids.shape[1], input_ids.shape[1]
                 )
 
         input_length = (
@@ -248,7 +263,9 @@ class GPT(nn.Module):
                 past_length, past_length + input_length, device=input_ids.device
             )
         else:
-            cache_position = cache_position.narrow(0, -input_length, input_length)
+            cache_position = _safe_narrow(
+                cache_position, 0, -input_length, input_length
+            )
 
         if has_static_cache:
             past_key_values = None
@@ -335,13 +352,15 @@ class GPT(nn.Module):
         manual_seed: Optional[int] = None,
         context=Context(),
     ):
-
         attentions: List[Optional[Tuple[torch.FloatTensor, ...]]] = []
         hiddens = []
         stream_iter = 0
 
-        start_idx, end_idx = inputs_ids.shape[1], torch.zeros(
-            inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+        start_idx, end_idx = (
+            inputs_ids.shape[1],
+            torch.zeros(
+                inputs_ids.shape[0], device=inputs_ids.device, dtype=torch.long
+            ),
         )
         finish = torch.zeros(inputs_ids.shape[0], device=inputs_ids.device).bool()
 
@@ -376,9 +395,11 @@ class GPT(nn.Module):
             dtype=inputs_ids.dtype,
             device=inputs_ids.device,
         )
-        inputs_ids_buf.narrow(1, 0, progress).copy_(inputs_ids)
+        # Ensure we never pass a negative length to narrow
+        progress_clamped = max(int(progress), 0)
+        inputs_ids_buf.narrow(1, 0, progress_clamped).copy_(inputs_ids)
         del inputs_ids
-        inputs_ids = inputs_ids_buf.narrow(1, 0, progress)
+        inputs_ids = inputs_ids_buf.narrow(1, 0, progress_clamped)
 
         pbar: Optional[tqdm] = None
 
@@ -392,7 +413,6 @@ class GPT(nn.Module):
         past_key_values = None
 
         for i in range(max_new_token):
-
             model_input = self._prepare_generation_inputs(
                 inputs_ids,
                 past_key_values,

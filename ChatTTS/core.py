@@ -1,32 +1,31 @@
+import logging
 import os
 import re
-import logging
 import tempfile
-from dataclasses import dataclass, asdict
-from typing import Literal, Optional, List, Tuple, Dict, Union
+from dataclasses import asdict, dataclass
 from json import load
 from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
 from vocos import Vocos
 from vocos.pretrained import instantiate_class
-from huggingface_hub import snapshot_download
 
 from .config import Config
-from .model import DVAE, Embed, GPT, gen_logits, Tokenizer, Speaker
+from .model import DVAE, GPT, Embed, Speaker, Tokenizer, gen_logits
+from .norm import Normalizer
 from .utils import (
-    load_safetensors,
+    FileLike,
     check_all_assets,
-    download_all_assets,
-    select_device,
-    get_latest_modified_file,
     del_all,
+    download_all_assets,
+    get_latest_modified_file,
+    load_safetensors,
+    select_device,
 )
 from .utils import logger as utils_logger
-from .utils import FileLike
-
-from .norm import Normalizer
 
 
 class Chat:
@@ -105,7 +104,7 @@ class Chat:
             if download_path is None or force_redownload:
                 self.logger.log(
                     logging.INFO,
-                    f"download from HF: https://huggingface.co/2Noise/ChatTTS",
+                    "download from HF: https://huggingface.co/2Noise/ChatTTS",
                 )
                 try:
                     download_path = snapshot_download(
@@ -305,9 +304,7 @@ class Chat:
                 # Vocos on mps will crash, use cpu fallback.
                 # Plus, complex dtype used in the decode process of Vocos is not supported in torch_npu now,
                 # so we put this calculation of data on CPU instead of NPU.
-                "cpu"
-                if "mps" in str(device) or "npu" in str(device)
-                else device
+                "cpu" if "mps" in str(device) or "npu" in str(device) else device
             )
             .eval()
         )
@@ -394,11 +391,16 @@ class Chat:
         do_homophone_replacement=True,
         split_text=True,
         max_split_batch=4,
-        params_refine_text=RefineTextParams(),
-        params_infer_code=InferCodeParams(),
+        params_refine_text: Optional[RefineTextParams] = None,
+        params_infer_code: Optional[InferCodeParams] = None,
     ):
-
         assert self.has_loaded(use_decoder=use_decoder)
+
+        # Avoid using mutable default arguments across calls
+        if params_refine_text is None:
+            params_refine_text = RefineTextParams()
+        if params_infer_code is None:
+            params_infer_code = InferCodeParams()
 
         if not isinstance(text, list):
             text = [text]
@@ -546,7 +548,6 @@ class Chat:
         return_hidden: bool,
         params: InferCodeParams,
     ):
-
         gpt = self.gpt
 
         if not isinstance(text, list):
@@ -574,7 +575,13 @@ class Chat:
             ),
             device=self.device_gpt,
         )
-        start_idx = input_ids.shape[-2]
+        # compute start index from sequence length (last dimension) and clamp to non-negative
+        start_idx = (
+            input_ids.size(-1)
+            if hasattr(input_ids, "size")
+            else (input_ids.shape[-1] if hasattr(input_ids, "shape") else 0)
+        )
+        start_idx = max(0, int(start_idx))
 
         num_code = self.config.gpt.num_audio_tokens - 1
 
@@ -667,7 +674,6 @@ class Chat:
         device: torch.device,
         params: RefineTextParams,
     ):
-
         gpt = self.gpt
 
         if not isinstance(text, list):
@@ -689,6 +695,14 @@ class Chat:
         if gpt.is_vllm:
             from .model.velocity import SamplingParams
 
+            # compute start index from sequence length (last dimension) and clamp to non-negative
+            start_idx = (
+                input_ids.size(-1)
+                if hasattr(input_ids, "size")
+                else (input_ids.shape[-1] if hasattr(input_ids, "shape") else 0)
+            )
+            start_idx = max(0, int(start_idx))
+
             sample_params = SamplingParams(
                 repetition_penalty=params.repetition_penalty,
                 temperature=params.temperature,
@@ -700,7 +714,7 @@ class Chat:
                 logits_processors=(logits_processors, logits_warpers),
                 eos_token=self.tokenizer.eos_token,
                 infer_text=True,
-                start_idx=input_ids.shape[-2],
+                start_idx=start_idx,
             )
             input_ids_list = [i.tolist() for i in input_ids]
             del input_ids

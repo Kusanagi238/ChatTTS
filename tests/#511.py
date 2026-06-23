@@ -1,4 +1,5 @@
-import os, sys
+import os
+import sys
 
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -9,7 +10,6 @@ sys.path.append(now_dir)
 import logging
 
 import ChatTTS
-
 from tools.logger import get_logger
 
 logger = get_logger("Test", lv=logging.WARN)
@@ -38,16 +38,22 @@ params_infer_code = ChatTTS.Chat.InferCodeParams(
 
 fail = False
 
-wavs = chat.infer(
-    texts,
-    skip_refine_text=True,
-    split_text=False,
-    params_infer_code=params_infer_code,
-)
+try:
+    wavs = chat.infer(
+        texts,
+        skip_refine_text=True,
+        split_text=False,
+        params_infer_code=params_infer_code,
+    )
+except RuntimeError as e:
+    logger.exception("chat.infer raised RuntimeError during generation: %s", e)
+    import pytest
+
+    pytest.fail(f"chat.infer raised RuntimeError: {e}")
 
 for k, wav in enumerate(wavs):
     if wav is None:
-        logger.warning("index", k, "is None")
+        logger.warning("index %s is None", k)
         fail = True
 
 if fail:

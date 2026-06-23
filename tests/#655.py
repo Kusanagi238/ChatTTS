@@ -1,4 +1,5 @@
-import os, sys
+import os
+import sys
 
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -11,7 +12,6 @@ import logging
 import torch
 
 import ChatTTS
-
 from tools.logger import get_logger
 from tools.normalizer import normalizer_en_nemo_text
 
@@ -69,7 +69,10 @@ input_ids, attention_mask, text_mask = chat.tokenizer.encode(
     device=chat.device_gpt,
 )
 with torch.inference_mode():
-    start_idx, end_idx = 0, torch.zeros(
+    start_idx = torch.zeros(
+        input_ids.shape[0], device=input_ids.device, dtype=torch.long
+    )
+    end_idx = torch.zeros(
         input_ids.shape[0], device=input_ids.device, dtype=torch.long
     ).fill_(input_ids.shape[1])
 
@@ -78,8 +81,8 @@ with torch.inference_mode():
             input_ids,
             start_idx,
             end_idx,
-            [],
-            [],
+            torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.long),
+            torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.long),
             True,
         ).ids
     )
